@@ -5,7 +5,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 const RALPH_DIR = ".ralph";
@@ -48,6 +48,7 @@ interface LoopState {
 	itemsPerIteration: number; // Prompt hint only - "process N items per turn"
 	reflectEvery: number; // Reflect every N iterations
 	reflectInstructions: string;
+	compactEachRound: boolean;
 	active: boolean; // Backwards compat
 	status: LoopStatus;
 	startedAt: string;
@@ -116,6 +117,7 @@ export default function (pi: ExtensionAPI) {
 	function migrateState(raw: Partial<LoopState> & { name: string }): LoopState {
 		if (!raw.status) raw.status = raw.active ? "active" : "paused";
 		raw.active = raw.status === "active";
+		if (raw.compactEachRound === undefined) raw.compactEachRound = false;
 		// Migrate old field names
 		if ("reflectEveryItems" in raw && !raw.reflectEvery) {
 			raw.reflectEvery = (raw as any).reflectEveryItems;
@@ -216,6 +218,9 @@ export default function (pi: ExtensionAPI) {
 			const next = state.reflectEvery - ((state.iteration - 1) % state.reflectEvery);
 			lines.push(theme.fg("dim", `Next reflection in: ${next} iterations`));
 		}
+		if (state.compactEachRound) {
+			lines.push(theme.fg("dim", "Context: compact before each new round"));
+		}
 		// Warning about stopping
 		lines.push("");
 		lines.push(theme.fg("warning", "ESC pauses the assistant"));
@@ -248,10 +253,59 @@ export default function (pi: ExtensionAPI) {
 			parts.push(`1. Continue working on the task`);
 		}
 		parts.push(`2. Update the task file (${state.taskFile}) with your progress`);
-		parts.push(`3. When FULLY COMPLETE, respond with: ${COMPLETE_MARKER}`);
-		parts.push(`4. Otherwise, call the ralph_done tool to proceed to next iteration`);
+		if (state.compactEachRound) {
+			parts.push(`3. This loop compacts context before each new round, so treat ${state.taskFile} as canonical memory`);
+			parts.push(`4. When FULLY COMPLETE, respond with: ${COMPLETE_MARKER}`);
+			parts.push(`5. Otherwise, call the ralph_done tool to proceed to next iteration`);
+		} else {
+			parts.push(`3. When FULLY COMPLETE, respond with: ${COMPLETE_MARKER}`);
+			parts.push(`4. Otherwise, call the ralph_done tool to proceed to next iteration`);
+		}
 
 		return parts.join("\n");
+	}
+
+	function buildCompactionInstructions(state: LoopState): string {
+		return [
+			`You are compacting context for Ralph loop "${state.name}".`,
+			`Preserve the canonical task state from ${state.taskFile}.`,
+			"Keep checklist progress, unfinished work, blockers, decisions, verification evidence, changed files, and exact next-step priorities.",
+			"Be concise, but do not drop any incomplete TODOs or the next action needed for the upcoming iteration.",
+		].join(" ");
+	}
+
+	function queueNextIteration(ctx: ExtensionContext, state: LoopState, taskContent: string, needsReflection: boolean): void {
+		const queuePrompt = () => {
+			const latest = loadState(ctx, state.name);
+			if (!latest || latest.status !== "active" || currentLoop !== state.name) return;
+			if (ctx.hasPendingMessages()) return;
+			const latestContent = tryRead(path.resolve(ctx.cwd, latest.taskFile)) ?? taskContent;
+			pi.sendUserMessage(buildPrompt(latest, latestContent, needsReflection), { deliverAs: "followUp" });
+		};
+
+		if (!state.compactEachRound) {
+			queuePrompt();
+			return;
+		}
+
+		if (ctx.hasUI) {
+			ctx.ui.notify(`Compacting context before Ralph iteration ${state.iteration}...`, "info");
+		}
+		ctx.compact({
+			customInstructions: buildCompactionInstructions(state),
+			onComplete: () => {
+				if (ctx.hasUI) {
+					ctx.ui.notify(`Compaction completed. Queuing Ralph iteration ${state.iteration}.`, "info");
+				}
+				queuePrompt();
+			},
+			onError: (error) => {
+				if (ctx.hasUI) {
+					ctx.ui.notify(`Compaction failed: ${error.message}. Continuing without compaction.`, "warning");
+				}
+				queuePrompt();
+			},
+		});
 	}
 
 	// --- Arg parsing ---
@@ -264,6 +318,7 @@ export default function (pi: ExtensionAPI) {
 			itemsPerIteration: 0,
 			reflectEvery: 0,
 			reflectInstructions: DEFAULT_REFLECT_INSTRUCTIONS,
+			compactEachRound: false,
 		};
 
 		for (let i = 0; i < tokens.length; i++) {
@@ -281,6 +336,8 @@ export default function (pi: ExtensionAPI) {
 			} else if (tok === "--reflect-instructions" && next) {
 				result.reflectInstructions = next.replace(/^"|"$/g, "");
 				i++;
+			} else if (tok === "--compact-each-round") {
+				result.compactEachRound = true;
 			} else if (!tok.startsWith("--")) {
 				result.name = tok;
 			}
@@ -295,7 +352,7 @@ export default function (pi: ExtensionAPI) {
 			const args = parseArgs(rest);
 			if (!args.name) {
 				ctx.ui.notify(
-					"Usage: /ralph start <name|path> [--items-per-iteration N] [--reflect-every N] [--max-iterations N]",
+					"Usage: /ralph start <name|path> [--items-per-iteration N] [--reflect-every N] [--max-iterations N] [--compact-each-round]",
 					"warning",
 				);
 				return;
@@ -326,6 +383,7 @@ export default function (pi: ExtensionAPI) {
 				itemsPerIteration: args.itemsPerIteration,
 				reflectEvery: args.reflectEvery,
 				reflectInstructions: args.reflectInstructions,
+				compactEachRound: args.compactEachRound,
 				active: true,
 				status: "active",
 				startedAt: existing?.startedAt || new Date().toISOString(),
@@ -555,12 +613,14 @@ Options:
   --items-per-iteration N  Suggest N items per turn (prompt hint)
   --reflect-every N        Reflect every N iterations
   --max-iterations N       Stop after N iterations (default 50)
+  --compact-each-round     Compact context before queuing each new round
 
 To stop: press ESC to interrupt, then run /ralph-stop when idle
 
 Examples:
   /ralph start my-feature
-  /ralph start review --items-per-iteration 5 --reflect-every 10`;
+  /ralph start review --items-per-iteration 5 --reflect-every 10
+  /ralph start sweep --compact-each-round`;
 
 	pi.registerCommand("ralph", {
 		description: "Ralph Wiggum - long-running development loops",
@@ -621,6 +681,7 @@ Examples:
 			itemsPerIteration: Type.Optional(Type.Number({ description: "Suggest N items per turn (0 = no limit)" })),
 			reflectEvery: Type.Optional(Type.Number({ description: "Reflect every N iterations" })),
 			maxIterations: Type.Optional(Type.Number({ description: "Max iterations (default: 50)", default: 50 })),
+			compactEachRound: Type.Optional(Type.Boolean({ description: "Compact context before queuing each new iteration" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const loopName = sanitize(params.name);
@@ -642,6 +703,7 @@ Examples:
 				itemsPerIteration: params.itemsPerIteration ?? 0,
 				reflectEvery: params.reflectEvery ?? 0,
 				reflectInstructions: DEFAULT_REFLECT_INSTRUCTIONS,
+				compactEachRound: params.compactEachRound ?? false,
 				active: true,
 				status: "active",
 				startedAt: new Date().toISOString(),
@@ -716,11 +778,17 @@ Examples:
 				return { content: [{ type: "text", text: `Error: Could not read task file: ${state.taskFile}` }], details: {} };
 			}
 
-			// Queue next iteration - use followUp so user can still interrupt
-			pi.sendUserMessage(buildPrompt(state, content, needsReflection), { deliverAs: "followUp" });
+			queueNextIteration(ctx, state, content, needsReflection);
 
 			return {
-				content: [{ type: "text", text: `Iteration ${state.iteration - 1} complete. Next iteration queued.` }],
+				content: [
+					{
+						type: "text",
+						text: state.compactEachRound
+							? `Iteration ${state.iteration - 1} complete. Compaction started; next iteration will queue after it completes.`
+							: `Iteration ${state.iteration - 1} complete. Next iteration queued.`,
+					},
+				],
 				details: {},
 			};
 		},
@@ -740,6 +808,9 @@ Examples:
 			instructions += `- Work on ~${state.itemsPerIteration} items this iteration\n`;
 		}
 		instructions += `- Update the task file as you progress\n`;
+		if (state.compactEachRound) {
+			instructions += `- Context compacts before each new round; treat ${state.taskFile} as canonical memory\n`;
+		}
 		instructions += `- When FULLY COMPLETE: ${COMPLETE_MARKER}\n`;
 		instructions += `- Otherwise, call ralph_done tool to proceed to next iteration`;
 
